@@ -35,7 +35,7 @@ client = AsyncOpenAI(
 )
 
 model = OpenAIChatCompletionsModel(
-    model="gemini-2.0-flash-exp",
+    model="gemini-2.5-flash",
     openai_client=client
 )
 
@@ -107,7 +107,7 @@ def _build_headers(token: str, tz: str = None) -> Dict[str, str]:
     return hdrs
 
 def _iso_day_window(date_str: str, tz: str, start_hour: int = WORKING_START_HOUR,
-                    end_hour: int = WORKING_END_HOUR) -> tuple[str, str]:
+                     end_hour: int = WORKING_END_HOUR) -> tuple[str, str]:
     """Convert date to ISO datetime range for working day."""
     try:
         if 'T' in date_str:
@@ -198,7 +198,7 @@ async def get_schedule(start_iso: str, end_iso: str, interval_min: int = 30, tz:
         return {"value": [{"scheduleItems": []}]}
 
 async def create_calendar_event(subject: str, start_iso: str, end_iso: str,
-                                attendees: List[str], tz: str = DEFAULT_TZ) -> Dict:
+                                 attendees: List[str], tz: str = DEFAULT_TZ) -> Dict:
     """Create calendar event with Teams meeting."""
     try:
         token = _get_access_token()
@@ -224,6 +224,26 @@ async def create_calendar_event(subject: str, start_iso: str, end_iso: str,
             return resp.json()
     except Exception as e:
         logger.error(f"Error creating calendar event: {e}")
+        raise
+
+async def update_calendar_event(event_id: str, new_start_iso: str, new_end_iso: str, tz: str = DEFAULT_TZ) -> Dict:
+    """Update a calendar event with a new start and end time."""
+    try:
+        token = _get_access_token()
+        body = {
+            "start": {"dateTime": new_start_iso, "timeZone": tz},
+            "end": {"dateTime": new_end_iso, "timeZone": tz},
+        }
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.patch(
+                f"{GRAPH_API_BASE}/users/{ORGANIZER}/events/{event_id}",
+                headers=_build_headers(token, tz),
+                json=body
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error(f"Error updating calendar event with ID {event_id}: {e}")
         raise
 
 def get_next_business_days(num_days: int = 7) -> List[str]:
@@ -317,6 +337,33 @@ async def create_calendar_event_tool(details: CalendarEventDetails) -> str:
         logger.error(f"Error creating event: {e}")
         return f"An error occurred while trying to create the event: {str(e)}"
 
+class RescheduleMeetingArgs(TypedDict):
+    event_id: str
+    new_start_iso: str
+    new_end_iso: str
+    tz: NotRequired[str]
+
+@function_tool
+async def reschedule_meeting_tool(details: RescheduleMeetingArgs) -> str:
+    """
+    Reschedules an existing calendar meeting by updating its start and end times.
+    Requires the event's unique ID.
+    """
+    event_id = details['event_id']
+    new_start_iso = details['new_start_iso']
+    new_end_iso = details['new_end_iso']
+    tz = details.get('tz', DEFAULT_TZ)
+    try:
+        updated_event = await update_calendar_event(
+            event_id=event_id,
+            new_start_iso=new_start_iso,
+            new_end_iso=new_end_iso,
+            tz=tz
+        )
+        return f"Successfully rescheduled event ID {event_id}. The new time is from {updated_event['start']['dateTime']} to {updated_event['end']['dateTime']}."
+    except Exception as e:
+        logger.error(f"Error rescheduling event: {e}")
+        return f"An error occurred while trying to reschedule the event: {str(e)}. Please provide a valid event ID."
 
 class BookMeetingArgs(TypedDict):
     customer_name: str
@@ -326,19 +373,20 @@ class BookMeetingArgs(TypedDict):
     start_time: str
     duration_min: int
 
+# FIXED: Simplified tool that returns clean response
 @function_tool
 async def book_meeting_advanced_tool(details: BookMeetingArgs) -> str:
     """Books a new calendar meeting with a Teams link."""
     try:
-        logger.info(f"🔄 Attempting to book meeting: {details}")
-        
+        logger.info(f"Attempting to book meeting: {details}")
+
         start_dt = dp.isoparse(f"{details['date']}T{details['start_time']}")
         end_dt = start_dt + timedelta(minutes=details['duration_min'])
         meeting_subject = f"{details['meeting_title']} - {details['customer_name']}"
         attendees_list = [details['customer_email']]
-        
-        logger.info(f"📅 Creating event: '{meeting_subject}' from {start_dt.isoformat()} to {end_dt.isoformat()}")
-        
+
+        logger.info(f"Creating event: '{meeting_subject}' from {start_dt.isoformat()} to {end_dt.isoformat()}")
+
         event = await create_calendar_event(
             subject=meeting_subject,
             start_iso=start_dt.isoformat(),
@@ -346,20 +394,20 @@ async def book_meeting_advanced_tool(details: BookMeetingArgs) -> str:
             attendees=attendees_list,
             tz=DEFAULT_TZ
         )
-        
-        logger.info(f"✅ Event response received: {json.dumps(event, indent=2)}")
-        
-        # Enhanced Teams link extraction
+
+        logger.info(f"Event response received: {json.dumps(event, indent=2)}")
+
+        # Extract Teams link
         join_url = None
         possible_paths = [
             ["onlineMeeting", "joinUrl"],
-            ["onlineMeeting", "joinWebUrl"], 
+            ["onlineMeeting", "joinWebUrl"],
             ["onlineMeeting", "join_url"],
             ["online_meeting", "joinUrl"],
             ["joinUrl"],
             ["webLink"]
         ]
-        
+
         for path in possible_paths:
             try:
                 temp_obj = event
@@ -370,41 +418,43 @@ async def book_meeting_advanced_tool(details: BookMeetingArgs) -> str:
                     break
             except (AttributeError, TypeError):
                 continue
-        
-        logger.info(f"🔗 Teams link extracted: {join_url}")
-        
+
+        logger.info(f"Teams link extracted: {join_url}")
+
+        # SIMPLIFIED RESPONSE - No complex formatting that might get stripped
         if join_url:
-            return f"""✅ **Meeting Booked Successfully!**
+            response = f"""Meeting Booked Successfully!
 
-📋 **Meeting Details:**
-• **Title:** {meeting_subject}
-• **Date:** {details['date']}
-• **Time:** {details['start_time']} 
-• **Duration:** {details['duration_min']} minutes
-• **Attendee:** {details['customer_email']}
+Meeting Details:
+- Title: {meeting_subject}
+- Date: {details['date']}
+- Time: {details['start_time']}
+- Duration: {details['duration_min']} minutes
+- Attendee: {details['customer_email']}
 
-🔗 **Teams Meeting Link:** 
-{join_url}
+Teams Meeting Link: {join_url}
 
-📧 Calendar invite has been sent to the attendee."""
+Calendar invite has been sent to the attendee."""
         else:
-            return f"""⚠️ **Meeting Created (No Teams Link)**
+            response = f"""Meeting Created (No Teams Link)
 
-📋 **Meeting Details:**
-• **Title:** {meeting_subject}
-• **Date:** {details['date']}
-• **Time:** {details['start_time']}
-• **Duration:** {details['duration_min']} minutes  
-• **Attendee:** {details['customer_email']}
+Meeting Details:
+- Title: {meeting_subject}
+- Date: {details['date']}
+- Time: {details['start_time']}
+- Duration: {details['duration_min']} minutes
+- Attendee: {details['customer_email']}
 
-❗ Meeting was created but Teams link unavailable. Check your calendar for meeting details.
+Meeting was created but Teams link unavailable. Check your calendar for meeting details.
 
-📧 Calendar invite has been sent to the attendee."""
-        
+Calendar invite has been sent to the attendee."""
+
+        logger.info(f"Tool returning response: {repr(response)}")
+        return response
+
     except Exception as e:
-        logger.error(f"💥 Booking failed: {str(e)}")
-        return f"❌ **Booking Failed**: {str(e)}"
-
+        logger.error(f"Booking failed: {str(e)}")
+        return f"Booking Failed: {str(e)}"
 
 class BusinessDaysArgs(TypedDict, total=False):
     num_days: int
@@ -436,47 +486,40 @@ def get_business_days_formatted_tool(details: BusinessDaysArgs = None) -> str:
     return f"The next 7 business days are: {'; '.join(day_strings)}."
 
 # -------------------------
-# Agent Definitions
+# Agent Definitions - FIXED INSTRUCTIONS
 # -------------------------
 
+# DEBUG: Agent with explicit tool calling instructions
 meeting_booking_assistant = Agent(
     name="Meeting Booking Assistant",
-    instructions="""You are a Meeting Booking Assistant. Your job is to collect meeting information and book meetings with Teams links.
+    instructions="""You are a Meeting Booking Assistant. You MUST call the book_meeting_advanced_tool when you have complete information.
 
-🎯 **WORKFLOW - FOLLOW EXACTLY:**
-1. Collect ALL 6 required pieces of information from the user
-2. As soon as you have ALL 6 pieces, IMMEDIATELY call book_meeting_advanced_tool
-3. Display the booking result to the user
-4. DO NOT ask "How can I help you?" after booking
+REQUIRED INFO:
+1. customer_name (any name format)
+2. customer_email (must contain @)
+3. meeting_title (any description)
+4. date (YYYY-MM-DD format - convert if needed)
+5. start_time (HH:MM format - convert if needed)
+6. duration_min (number of minutes)
 
-📋 **REQUIRED INFORMATION (collect all before booking):**
-- customer_name: Full name of the person attending
-- customer_email: Email address (must contain @)
-- meeting_title: Subject/purpose of the meeting  
-- date: Date in YYYY-MM-DD format (must be future date)
-- start_time: Start time in HH:MM format (24-hour time)
-- duration_min: Duration in minutes (15-240)
+CRITICAL WORKFLOW:
+- When you have ALL 6 pieces of information, you MUST IMMEDIATELY call book_meeting_advanced_tool
+- Do NOT ask for confirmation or additional details once you have the 6 required pieces
+- Convert formats as needed (2pm → 14:00, tomorrow → actual date, 1 hour → 60)
 
-💡 **EXAMPLE:**
-User: "Book a meeting with Sarah Johnson"
-You: "I'll help book that meeting. I need:
-• What's Sarah Johnson's email?
-• What's the meeting about?  
-• Which date (YYYY-MM-DD)?
-• What time (HH:MM)?
-• How long in minutes?"
+FORMAT CONVERSIONS:
+- Times: 2pm=14:00, 3pm=15:00, 9am=09:00, 10:30am=10:30
+- Dates: tomorrow=next calendar day in YYYY-MM-DD, today=today's date
+- Duration: 30 min=30, 1 hour=60, 45 minutes=45
 
-When you get all 6 pieces → IMMEDIATELY call the tool. Don't ask anything else.
+EXAMPLE:
+User: "Asfand, asfand@email.com, project meeting tomorrow 2pm 30 minutes"
+You: [Convert tomorrow to date, 2pm to 14:00, then IMMEDIATELY call tool]
 
-🚫 **CRITICAL RULES:**
-- NEVER say "How can I help?" after collecting info
-- ALWAYS call book_meeting_advanced_tool when you have complete details
-- NEVER just describe what you'd do - actually call the tool""",
+DEBUGGING: Always state what information you have before calling the tool.""",
     tools=[book_meeting_advanced_tool],
     model=model
 )
-
-
 
 calendar_and_availability_agent = Agent(
     name="Calendar and Availability Agent",
@@ -485,12 +528,13 @@ calendar_and_availability_agent = Agent(
     KEY RESPONSIBILITIES:
     1. Find free time slots for a specified date and duration using `find_free_time_tool`.
     2. List all available slots for a given date using `list_available_slots_tool`.
-    3. Create a new calendar event with a subject, date, time, and list of attendees using `create_calendar_event_tool`.
-    4. Handle timezone considerations (default is Arabian Standard Time).
-    5. Validate duration parameters (minimum 15 minutes, maximum 240 minutes) for finding slots.
+    3. Create a new calendar event with a subject, date, time, and list of attendees using `Calendar_tool`.
+    4. **Reschedule an existing meeting by updating its date and time using `reschedule_meeting_tool`.** You need a valid event ID for this.
+    5. Handle timezone considerations (default is Arabian Standard Time).
+    6. Validate duration parameters (minimum 15 minutes, maximum 240 minutes) for finding slots.
     
     Always provide clear, user-friendly responses and gracefully handle errors.""",
-    tools=[find_free_time_tool, list_available_slots_tool, create_calendar_event_tool],
+    tools=[find_free_time_tool, list_available_slots_tool, create_calendar_event_tool, reschedule_meeting_tool],
     model=model
 )
 
@@ -516,35 +560,25 @@ business_days_finder = Agent(
     model=model
 )
 
-# -------------------------
-# New Agent: Advanced meeting booking with customer details
-# -------------------------
-
-# -------------------------
-# Main Dispatcher Agent with Handoff
-# -------------------------
-
 main_dispatcher_agent = Agent(
     name="Main Dispatcher Agent",
-    instructions="""You are a top-level dispatcher agent. 
+    instructions="""You are a top-level dispatcher agent.
 Your role is to understand the user's request and hand off to the correct specialized agent.
 
 Use the `handoff` function to pass control to:
-- **'Meeting Booking Assistant'**: If the user wants to book a meeting (collect details if missing).
-- **'Calendar and Availability Agent'**: If the user is asking to find available time slots, check for free time, or create a new calendar event.
+- **'Meeting Booking Assistant'**: If the user wants to book a new meeting (collect details if missing).
+- **'Calendar and Availability Agent'**: If the user is asking to find available time slots, check for free time, create a new calendar event, or **reschedule** an existing one.
 - **'Business Days Finder'**: If the user is asking about future business days.
 
 If a request doesn't fit any specialized agent (e.g., greetings, general knowledge), respond directly.
 """,
-    handoffs=[ calendar_and_availability_agent, business_days_finder, meeting_booking_assistant],
+    handoffs=[calendar_and_availability_agent, business_days_finder, meeting_booking_assistant],
     model=model
 )
 
-
-
-# ==========================================================# ==========================================================
-# ✅ Chainlit Integration (Replaces old main() tests)
-# ==========================================================
+# -------------------------
+# Chainlit Integration - FIXED
+# -------------------------
 import chainlit as cl
 
 # Lower noisy logs from agent library if needed
@@ -557,72 +591,68 @@ async def start():
     cl.user_session.set("agent", main_dispatcher_agent)
     await cl.Message(
         content=(
-            "👋 Hi! I'm your **Meeting Assistant**.\n\n"
+            "Hi! I'm your Meeting Assistant.\n\n"
             "I can help you with:\n"
-            "• 📅 Booking meetings (give full details or I will ask follow-ups)\n"
-            "• 🕒 Finding free slots (e.g. 'Find slots on 2025-10-20 for 30 minutes')\n"
-            "• 📆 Listing upcoming business days (e.g. 'next 5 business days')\n\n"
+            "• Booking meetings (give full details or I will ask follow-ups)\n"
+            "• **Rescheduling meetings (provide the event ID, new date, and time)**\n"
+            "• Finding free slots (e.g. 'Find slots on 2025-10-20 for 30 minutes')\n"
+            "• Listing upcoming business days (e.g. 'next 5 business days')\n\n"
             "Type your request and I'll handle the rest."
         )
     ).send()
 
-# Replace the on_message function in your code with this version:
-
 @cl.on_message
 async def on_message(message: cl.Message):
+    """Handle incoming messages and extract clean agent responses."""
     user_text = message.content.strip()
     try:
-        # Retrieve the agent from the user session
         agent = cl.user_session.get("agent")
-        
-        # Create a runner
         runner = Runner()
-        
-        try:
-            # Run with streaming
-            response_msg = cl.Message(content="")
-            await response_msg.send()
-            
-            final_output = ""  # collect final string
-            
-            async for chunk in runner.run(agent, user_text, stream=True):
-                if isinstance(chunk, str):
-                    final_output += chunk
-                    await response_msg.stream_token(chunk)
-                elif isinstance(chunk, dict) and "output" in chunk:
-                    final_output += chunk["output"]
-                    await response_msg.stream_token(chunk["output"])
-            
-            # Update once with the full final output
-            await response_msg.update(content=final_output)
-            
-        except TypeError as e:
-            if "unexpected keyword argument 'stream'" in str(e):
-                # Run without streaming
-                result = await runner.run(agent, user_text)
 
-                # Extract only the final output string
-                if isinstance(result, str):
-                    content = result
-                elif isinstance(result, dict):
-                    content = result.get("output", result.get("content", str(result)))
-                elif hasattr(result, "final_output"):
-                    content = getattr(result, "final_output")
-                elif hasattr(result, "output"):
-                    content = getattr(result, "output")
-                elif hasattr(result, "content"):
-                    content = result.content
-                else:
-                    content = str(result)
+        # Run the agent
+        result = await runner.run(agent, user_text)
 
-                await cl.Message(content=content).send()
-            else:
-                raise e
+        # Extract clean content with multiple fallback methods
+        clean_content = None
+
+        # Method 1: Try final_output attribute
+        if hasattr(result, 'final_output') and result.final_output:
+            clean_content = result.final_output
+            logger.info("Using final_output attribute")
+
+        # Method 2: Direct string result
+        elif isinstance(result, str):
+            clean_content = result
+            logger.info("Using direct string result")
+
+        # Method 3: Dict with final_output key
+        elif isinstance(result, dict) and 'final_output' in result:
+            clean_content = result['final_output']
+            logger.info("Using dict final_output")
+
+        # Method 4: Parse from string representation
+        else:
+            result_str = str(result)
+            if "Final output (str): " in result_str:
+                parts = result_str.split("Final output (str): ", 1)
+                if len(parts) > 1:
+                    # Extract content until next section marker
+                    clean_part = parts[1].split("\n*")[0].strip()
+                    clean_content = clean_part
+                    logger.info("Extracted from string pattern")
+
+        # Fallback
+        if not clean_content:
+            clean_content = "Sorry, I couldn't process that request properly."
+            logger.warning("Using fallback content")
+
+        logger.info(f"Sending to Chainlit: {repr(clean_content)}")
+
+        # Send the clean content to Chainlit
+        await cl.Message(content=clean_content).send()
 
     except Exception as e:
         logger.exception("Error handling user message")
         await cl.Message(
-            content=f"⚠️ Sorry — an error occurred while processing your request: {str(e)}"
-        ).send()
-
-
+            content=f"Sorry — an error occurred: {str(e)}"
+    ).send()
